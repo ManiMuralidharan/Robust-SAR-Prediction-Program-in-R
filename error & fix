@@ -1,0 +1,25 @@
+If the GUI function doesn't start upon click. 
+Don't worry, this happens sometimes! The application is almost certainly running in the background, but R just failed to trigger your computer to open the web browser automatically.
+
+Here is how to get into the app right now:
+
+Method 1: The Manual Link (Fastest)
+Look at your R console, just below where it printed "The application will open in your default browser." Do you see a line that looks something like this?
+Listening on http://127.0.0.1:4532
+
+Highlight and copy that web address (the http://127.0.0.1:XXXX part).
+
+Open Chrome, Edge, or Firefox.
+
+Paste that address into the URL bar and hit Enter.
+The dashboard should immediately appear!
+
+Method 2: Force R to Open It
+If you don't see that link, or if the console is stuck, hit the Escape (Esc) key on your keyboard to stop the current process. Then, run these two lines of code to explicitly force R to open your browser:
+
+R
+# 1. Force the browser to open
+options(shiny.launch.browser = TRUE)
+
+# 2. Run the app again
+run_sar_gui()
