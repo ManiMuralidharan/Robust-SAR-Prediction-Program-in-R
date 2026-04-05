@@ -1,0 +1,395 @@
+# =====================================================
+# PRODUCTION-GRADE JAVA-FREE SAR PREDICTION SYSTEM v3.0
+# Vectorized Descriptors, XGBoost, & Hyperparameter Tuning
+# =====================================================
+
+# -----------------------------
+# Required packages
+# -----------------------------
+packages <- c(
+  "shiny", "randomForest", "xgboost", "caret", "pROC",
+  "ggplot2", "DT", "dplyr", "stringr", "shinythemes"
+)
+
+install_if_missing <- function(p) {
+  if (!require(p, character.only = TRUE, quietly = TRUE)) {
+    message(paste("Installing", p))
+    install.packages(p, dependencies = TRUE)
+    library(p, character.only = TRUE)
+  }
+}
+invisible(lapply(packages, install_if_missing))
+
+library(shiny)
+library(randomForest)
+library(xgboost)
+library(caret)
+library(ggplot2)
+library(dplyr)
+library(stringr)
+library(DT)
+library(pROC)
+library(shinythemes)
+
+# =====================================================
+# 1. ROBUST ERROR HANDLING
+# =====================================================
+is_valid_smiles <- function(smi_vec) {
+  # Regex to check if the string contains only valid SMILES characters
+  valid_chars <- grepl("^[A-Za-z0-9@+\\-\\[\\]\\(\\)\\\\/%=#$.:*]+$", smi_vec)
+  not_empty <- nchar(smi_vec) > 0 & !is.na(smi_vec)
+  return(valid_chars & not_empty)
+}
+
+# =====================================================
+# 2. VECTORIZED DESCRIPTOR GENERATION (MASSIVELY SCALABLE)
+# =====================================================
+generate_descriptors_fast <- function(smiles_vec) {
+  
+  if (length(smiles_vec) == 0) return(NULL)
+  smi <- as.character(smiles_vec)
+  
+  # Safe division helper
+  safe_div <- function(num, den) ifelse(den == 0 | is.na(den), 0, num / den)
+  
+  # Vectorized creation of 2D Descriptors & Pharmacophores
+  desc_df <- data.frame(
+    # Basic Topologies
+    Length = nchar(smi),
+    AtomCount = str_count(smi, "[A-Z]"),
+    AromaticAtoms = str_count(smi, "[a-z]"),
+    DoubleBonds = str_count(smi, "="),
+    TripleBonds = str_count(smi, "#"),
+    Rings = str_count(smi, "\\d"),
+    Branches = str_count(smi, "\\("),
+    ChiralCenters = str_count(smi, "@"),
+    
+    # Elemental Counts
+    C_count = str_count(smi, "C"),
+    N_count = str_count(smi, "N"),
+    O_count = str_count(smi, "O"),
+    S_count = str_count(smi, "S"),
+    F_count = str_count(smi, "F"),
+    Cl_count = str_count(smi, "Cl"),
+    Br_count = str_count(smi, "Br"),
+    
+    # Advanced Structural Fragments (Poor Man's MACCS Keys)
+    IsBenzene = as.numeric(grepl("c1ccccc1", smi)),
+    IsPyridine = as.numeric(grepl("c1cnccc1|c1ccncc1", smi)),
+    HasCarbonyl = as.numeric(grepl("C=O", smi)),
+    HasAmide = as.numeric(grepl("NC=O|C\\(=O\\)N", smi)),
+    HasCarboxyl = as.numeric(grepl("C\\(=O\\)O", smi)),
+    HasEther = as.numeric(grepl("COC", smi)),
+    HasNitro = as.numeric(grepl("N=O|N\\(=O\\)", smi)),
+    HasSulfonamide = as.numeric(grepl("S\\(=O\\)\\(=O\\)N", smi)),
+    HasNitrile = as.numeric(grepl("C#N", smi)),
+    HasImidazole = as.numeric(grepl("N1C=NC=N1", smi)),
+    HasHalogen = as.numeric(grepl("F|Cl|Br|I", smi))
+  )
+  
+  # Molecular Proxies (Vectorized Math)
+  desc_df$LogP_Proxy <- desc_df$C_count * 0.5 - desc_df$N_count * 0.3 - desc_df$O_count * 0.4
+  desc_df$MW_Proxy <- desc_df$C_count * 12 + desc_df$N_count * 14 + desc_df$O_count * 16 + desc_df$F_count * 19 + desc_df$Cl_count * 35.5
+  desc_df$H_Donors <- str_count(smi, "OH|NH")
+  desc_df$H_Acceptors <- desc_df$O_count + desc_df$N_count
+  
+  # Ratios
+  desc_df$ComplexityIndex <- safe_div(desc_df$Length, desc_df$AtomCount)
+  desc_df$HeteroatomRatio <- safe_div((desc_df$N_count + desc_df$O_count + desc_df$S_count + desc_df$F_count + desc_df$Cl_count), desc_df$AtomCount)
+  desc_df$AromaticRatio <- safe_div(desc_df$AromaticAtoms, desc_df$AtomCount)
+  
+  # Remove zero-variance columns (Only during training when rows > 1)
+  if (nrow(desc_df) > 1) {
+    variances <- apply(desc_df, 2, var, na.rm = TRUE)
+    desc_df <- desc_df[, variances > 0, drop = FALSE]
+  }
+  
+  # Scrub any residual NAs
+  desc_df[is.na(desc_df)] <- 0
+  return(desc_df)
+}
+
+# =====================================================
+# 3. ADVANCED MODEL TRAINING (CARET ENSEMBLE)
+# =====================================================
+train_advanced_model <- function(descriptors, activity, test_ratio = 0.2, model_type = "rf", tune = FALSE) {
+  
+  # Caret requires explicit factor names for classification (not just 1/0)
+  activity_factor <- factor(ifelse(activity == 1, "Active", "Inactive"), levels = c("Active", "Inactive"))
+  
+  set.seed(42)
+  train_idx <- createDataPartition(activity_factor, p = 1 - test_ratio, list = FALSE)
+  
+  train_x <- descriptors[train_idx, , drop = FALSE]
+  test_x <- descriptors[-train_idx, , drop = FALSE]
+  train_y <- activity_factor[train_idx]
+  test_y <- activity_factor[-train_idx]
+  
+  # Control object: Use CV if tuning is enabled, otherwise train once quickly
+  trControl <- trainControl(
+    method = ifelse(tune, "cv", "none"),
+    number = ifelse(tune, 5, 1),
+    classProbs = TRUE, 
+    summaryFunction = twoClassSummary,
+    allowParallel = TRUE
+  )
+  
+  # Train based on selected model
+  if (model_type == "rf") {
+    # Random Forest Grid
+    tuneGrid <- if(tune) expand.grid(mtry = c(2, floor(sqrt(ncol(train_x))), floor(ncol(train_x)/2))) else expand.grid(mtry = floor(sqrt(ncol(train_x))))
+    
+    model <- train(
+      x = train_x, y = train_y, 
+      method = "rf", metric = "ROC", 
+      trControl = trControl, tuneGrid = tuneGrid, 
+      ntree = 200 # Lowered ntree slightly for speed
+    )
+    
+  } else if (model_type == "xgbTree") {
+    # XGBoost Grid
+    tuneGrid <- if(tune) {
+      expand.grid(
+        nrounds = c(50, 150),
+        max_depth = c(3, 6),
+        eta = c(0.1, 0.3),
+        gamma = 0,
+        colsample_bytree = 0.8,
+        min_child_weight = 1,
+        subsample = 0.8
+      )
+    } else {
+      expand.grid(nrounds = 100, max_depth = 4, eta = 0.3, gamma = 0, colsample_bytree = 0.8, min_child_weight = 1, subsample = 0.8)
+    }
+    
+    model <- train(
+      x = train_x, y = train_y, 
+      method = "xgbTree", metric = "ROC", 
+      trControl = trControl, tuneGrid = tuneGrid, 
+      verbosity = 0
+    )
+  }
+  
+  # Predict Test Set
+  test_pred <- predict(model, test_x)
+  test_prob <- predict(model, test_x, type = "prob")
+  
+  # Metrics
+  conf_mat <- confusionMatrix(test_pred, test_y)
+  roc_obj <- pROC::roc(ifelse(test_y == "Active", 1, 0), test_prob$Active, direction = "<")
+  
+  # Extract Feature Importance correctly from Caret
+  imp_obj <- varImp(model)$importance
+  imp_df <- data.frame(Feature = rownames(imp_obj), Importance = imp_obj$Overall)
+  imp_df <- imp_df[order(imp_df$Importance, decreasing = TRUE), ]
+  
+  list(
+    model = model,
+    accuracy = conf_mat$overall["Accuracy"],
+    auc = as.numeric(pROC::auc(roc_obj)),
+    sensitivity = conf_mat$byClass["Sensitivity"],
+    specificity = conf_mat$byClass["Specificity"],
+    importance = imp_df,
+    descriptor_names = colnames(train_x),
+    test_prob = test_prob$Active,
+    test_y = test_y,
+    confusion_matrix = conf_mat$table
+  )
+}
+
+# =====================================================
+# 4. ENHANCED SHINY UI & SERVER
+# =====================================================
+run_sar_gui <- function() {
+  
+  ui <- fluidPage(
+    theme = shinytheme("flatly"),
+    titlePanel("🧪 Pro SAR Prediction System (Vectorized + XGBoost)"),
+    
+    sidebarLayout(
+      sidebarPanel(
+        width = 3,
+        
+        h4("1. Data Upload"),
+        fileInput("file", "Upload CSV File", accept = c(".csv", ".txt")),
+        uiOutput("cols"),
+        hr(),
+        
+        h4("2. Model Architecture"),
+        selectInput("model_choice", "Machine Learning Algorithm", 
+                    choices = c("Random Forest" = "rf", "XGBoost (Gradient Boosting)" = "xgbTree")),
+        checkboxInput("tune_hyper", "Enable Deep Tuning (5-Fold CV)", value = FALSE),
+        helpText("Tuning finds the mathematically optimal model but takes longer to train."),
+        
+        sliderInput("split", "Test Set Split (%)", min = 10, max = 40, value = 20),
+        actionButton("train", "🚀 Train Model", class = "btn-primary", style = "width:100%;"),
+        hr(),
+        
+        h4("3. Batch Prediction"),
+        textAreaInput("new", "Enter SMILES (one per line)", rows = 5, placeholder = "CC(=O)OC1=CC=CC=C1C(=O)O"),
+        actionButton("pred", "🔮 Predict", class = "btn-success", style = "width:100%;")
+      ),
+      
+      mainPanel(
+        width = 9,
+        tabsetPanel(id = "main_tabs",
+                    tabPanel("📊 Data Setup",
+                             br(), DTOutput("tbl"), br(), verbatimTextOutput("data_stats")),
+                    
+                    tabPanel("📈 Model Analytics",
+                             br(), verbatimTextOutput("perf"), br(),
+                             fluidRow(
+                               column(6, h4("ROC Curve"), plotOutput("roc", height = "350px")),
+                               column(6, h4("Feature Importance (Top 15)"), plotOutput("importance", height = "350px"))
+                             ),
+                             h4("Confusion Matrix"), verbatimTextOutput("conf_mat")),
+                    
+                    tabPanel("🔮 Predictions",
+                             br(), DTOutput("pred_tbl"), br(),
+                             h4("Probability Distribution"), plotOutput("pred_dist", height = "300px"))
+        )
+      )
+    )
+  )
+  
+  server <- function(input, output, session) {
+    rv <- reactiveValues(data = NULL, res = NULL)
+    
+    # Load Data
+    observeEvent(input$file, {
+      req(input$file)
+      rv$data <- read.csv(input$file$datapath, stringsAsFactors = FALSE)
+      showNotification(paste("Loaded", nrow(rv$data), "rows."), type = "message")
+    })
+    
+    output$cols <- renderUI({
+      req(rv$data)
+      tagList(
+        selectInput("smi", "SMILES Column", choices = names(rv$data), selected = names(rv$data)[1]),
+        selectInput("act", "Activity Column (0/1)", choices = names(rv$data), selected = names(rv$data)[2])
+      )
+    })
+    
+    output$tbl <- renderDT({ req(rv$data); datatable(rv$data, options = list(pageLength = 5, scrollX = TRUE)) })
+    
+    # Train Model
+    observeEvent(input$train, {
+      req(rv$data, input$smi, input$act)
+      
+      # 1. Input Validation
+      raw_smi <- rv$data[[input$smi]]
+      raw_act <- rv$data[[input$act]]
+      
+      valid_flags <- is_valid_smiles(raw_smi) & !is.na(raw_act)
+      smi <- raw_smi[valid_flags]
+      act <- raw_act[valid_flags]
+      
+      rejected <- length(raw_smi) - length(smi)
+      if (rejected > 0) {
+        showNotification(sprintf("Removed %d invalid or empty SMILES strings.", rejected), type = "warning", duration = 5)
+      }
+      if (length(smi) < 10) {
+        showNotification("Not enough valid molecules to train a model (>10 required).", type = "error")
+        return()
+      }
+      
+      showNotification("Vectorizing descriptors...", type = "message")
+      
+      tryCatch({
+        withProgress(message = 'Machine Learning Pipeline...', value = 0.2, {
+          
+          # Vectorized processing is instant
+          desc <- generate_descriptors_fast(smi)
+          
+          incProgress(0.4, detail = paste("Training", input$model_choice, "..."))
+          rv$res <- train_advanced_model(
+            descriptors = desc, 
+            activity = act, 
+            test_ratio = input$split / 100, 
+            model_type = input$model_choice, 
+            tune = input$tune_hyper
+          )
+        })
+        
+        showNotification("✅ Training Complete!", type = "message")
+        updateTabsetPanel(session, inputId = "main_tabs", selected = "📈 Model Analytics")
+        
+      }, error = function(e) {
+        showNotification(paste("Error:", e$message), type = "error")
+      })
+    })
+    
+    # Analytics
+    output$perf <- renderPrint({
+      req(rv$res)
+      cat(sprintf("Model: %s\nAccuracy: %.3f | AUC: %.3f\nSensitivity: %.3f | Specificity: %.3f", 
+                  input$model_choice, rv$res$accuracy, rv$res$auc, rv$res$sensitivity, rv$res$specificity))
+    })
+    
+    output$conf_mat <- renderPrint({ req(rv$res); print(rv$res$confusion_matrix) })
+    
+    output$roc <- renderPlot({
+      req(rv$res)
+      roc_obj <- pROC::roc(ifelse(rv$res$test_y == "Active", 1, 0), rv$res$test_prob, direction = "<")
+      plot(roc_obj, col = "#2c7fb8", lwd = 3, main = paste("Test AUC =", round(rv$res$auc, 3)))
+    })
+    
+    output$importance <- renderPlot({
+      req(rv$res)
+      df <- head(rv$res$importance, 15)
+      ggplot(df, aes(x = reorder(Feature, Importance), y = Importance)) +
+        geom_bar(stat = "identity", fill = "#E69F00") +
+        coord_flip() + theme_minimal() + labs(x = "", y = "Relative Importance")
+    })
+    
+    # Predict
+    observeEvent(input$pred, {
+      req(rv$res, input$new)
+      
+      raw_smi <- trimws(unlist(strsplit(input$new, "\n")))
+      smi <- raw_smi[is_valid_smiles(raw_smi)]
+      
+      if (length(smi) == 0) {
+        showNotification("No valid SMILES detected.", type = "warning")
+        return()
+      }
+      
+      desc_new <- generate_descriptors_fast(smi)
+      
+      # Column alignment padding
+      needed <- rv$res$descriptor_names
+      for (m in setdiff(needed, colnames(desc_new))) desc_new[[m]] <- 0
+      desc_new <- desc_new[, needed, drop = FALSE]
+      
+      # Predict via Caret
+      prob <- predict(rv$res$model, desc_new, type = "prob")$Active
+      
+      out <- data.frame(
+        SMILES = smi,
+        Probability = round(prob, 4),
+        Prediction = ifelse(prob > 0.5, "ACTIVE", "INACTIVE")
+      )
+      out <- out[order(out$Probability, decreasing = TRUE), ]
+      
+      output$pred_tbl <- renderDT({
+        datatable(out, options = list(pageLength = 10)) %>%
+          formatStyle("Prediction", backgroundColor = styleEqual(c("ACTIVE", "INACTIVE"), c("#00a65a", "#dd4b39")), color = "white")
+      })
+      
+      output$pred_dist <- renderPlot({
+        ggplot(out, aes(x = Probability, fill = Prediction)) +
+          geom_histogram(bins = 15, color="white") +
+          geom_vline(xintercept = 0.5, linetype = "dashed") +
+          scale_fill_manual(values = c("ACTIVE" = "#00a65a", "INACTIVE" = "#dd4b39")) +
+          theme_minimal()
+      })
+      
+      updateTabsetPanel(session, inputId = "main_tabs", selected = "🔮 Predictions")
+    })
+  }
+  
+  shinyApp(ui, server)
+}
+
+cat("\n🚀 Booting Production SAR System (Vectorized)...\n")
+run_sar_gui()
